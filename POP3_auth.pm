@@ -7,7 +7,7 @@
 
 # Net::POP3_auth is a small extension to G. Barr's Net::POP3
 # to authenticate to an POP3 server using one of the AUTH methods
-# APOP, CRAM-MD5 or PLAIN. This module can be expanded and is a
+# APOP and SASL (Authen::SASL). This module can be expanded and is a
 # very first implementation.
 
 package Net::POP3_auth;
@@ -24,8 +24,9 @@ use Net::Config;
 use Net::POP3;
 use MIME::Base64;
 use Digest::HMAC_MD5 qw(hmac_md5_hex);
+use Authen::SASL;
 
-$VERSION = "0.02";
+$VERSION = "0.03";
 
 @ISA = qw(Net::POP3);
 
@@ -47,44 +48,80 @@ sub auth_types {
   return wantarray ? @auth : join " ", @auth;
 }
 
+
 sub auth {
   @_ == 4 or croak 'usage: $pop3->auth( AUTH, USER, PASS )';
-  my ($me, $auth_type, $user, $pass) = @_;
+  my ($me, $auth, $user, $pass) = @_;
 
-  ## go for auth cram-md5
-  if (uc($auth_type) eq "CRAM-MD5") {
-
-    $me->_AUTH("CRAM-MD5");
-    (my $stamp) = ($me->message =~ /^\+\s+(.+)$/);
-    return undef unless $stamp;
-
-    my $hmac = hmac_md5_hex(decode_base64($stamp), $pass);
-    my $answer = encode_base64($user . " " . $hmac); $answer =~ s/\n//g;
-    return undef
-      unless $me->command($answer)->response() == CMD_OK;
-    return $me->_get_mailbox_count();
-
-  ## go for auth plain
-  } elsif (uc($auth_type) eq "PLAIN") {
-
-    return $me->login($user, $pass);
-
-  ## go for apop
-  } elsif (uc($auth_type) eq "APOP") {
-
+  ## conventional (rfc1939)
+  if (uc($auth) eq "APOP") {
     return $me->apop($user, $pass);
-
-  ## other auth methods not supported
-  } else {
-    carp "Net::POP3_auth: authentication type \"$auth_type\" not supported";
-    return;
   }
 
+  elsif (uc($auth) eq "PLAIN") { # standard authentication (user/pass)
+    return $me->login($user, $pass);
+  }
+
+  ## sasl (rfc1734)
+  else {
+
+    my $sasl = Authen::SASL->new(
+				 mechanism => uc($auth),
+				 callback => {
+					      authname => $user,
+					      user     => $user,
+					      pass     => $pass,
+					     },
+				);
+    return unless $sasl;
+    my $host = ${*$me}{'net_pop3_host'};
+    my $conn = $sasl->client_new("pop3", $host);#, "noplaintext noanonymous");
+
+    $me->_AUTH($auth) or return;
+
+    if ( $me->code() == 201 ) {
+
+      if (my $initial = $conn->client_start)
+	{
+	  $me->command(encode_base64($initial, ''))->response();
+	  return 1 if $me->code() == 200;
+	}
+
+    while ( $me->code() == 201 )
+      {
+	my $message = decode_base64($me->message());
+	my $return = $conn->client_step($message);
+	$me->command(encode_base64($return, ''))->response();
+	return 1 if $me->code() == 200;
+	return   if $me->code() == 500;
+      }
+    }
+  }
 }
 
 
-sub _AUTH { shift->command("AUTH", @_)->response() } ## will not match CMD_OK
+sub _AUTH { shift->command("AUTH", @_)->response() == CMD_OK }
 sub _CAPA { shift->command("CAPA")->response() == CMD_OK }
+
+
+sub response
+{
+ my $cmd = shift;
+ my $str = $cmd->getline() || return undef;
+ my $code = "500";
+
+ $cmd->debug_print(0,$str)
+   if ($cmd->debug);
+
+ if ($str =~ s/^\+OK\s+//io)  { $code = "200" }
+ elsif ($str =~ s/^\+\s+//io) { $code = "201" } ## for auth
+ else                         { $str =~ s/^-ERR\s+//io; }
+
+ ${*$cmd}{'net_cmd_resp'} = [ $str ];
+ ${*$cmd}{'net_cmd_code'} = $code;
+
+ substr($code,0,1);
+}
 
 1;
 
@@ -105,10 +142,10 @@ Net::POP3_auth - Post Office Protocol 3 Client with AUTHentication
 
 =head1 DESCRIPTION
 
-This module implements a client interface to the POP3 protocol AUTH 
-service extension, enabling a perl5 application to talk to and 
-authenticate against POP3 servers. This documentation assumes 
-that you are familiar with the concepts of the POP3 protocol described 
+This module implements a client interface to the POP3 protocol AUTH
+service extension, enabling a perl5 application to talk to and
+authenticate against POP3 servers. This documentation assumes
+that you are familiar with the concepts of the POP3 protocol described
 in RFC1939 and with the AUTH service extension described in RFC1734.
 
 A new Net::POP3_auth object must be created with the I<new> method. Once
@@ -139,7 +176,7 @@ for the user at the POP3 server known as mailhost:
 =item new Net::POP3_auth [ HOST, ] [ OPTIONS ]
 
 This is the constructor for a new Net::POP3_auth object. It is
-taken from Net::POP3 as all other methods (except I<auth> and 
+taken from Net::POP3 as all other methods (except I<auth> and
 I<auth_types>) are, too.
 
 =head1 METHODS
@@ -153,19 +190,24 @@ empty list.
 
 =item auth_types ()
 
-Returns the AUTH methods supported by the server as an array or in a space 
+Returns the AUTH methods supported by the server as an array or in a space
 separated string. This list is exacly the line given by the POP3 server after
-the C<CAPA> command containing the keyword C<AUTH> and the method APOP if 
+the C<CAPA> command containing the keyword C<AUTH> and the method APOP if
 the C<CAPA> command contains the keyword C<APOP>.
 
 =item auth ( AUTH, USER, PASSWORD )
 
 Authenticates the user C<USER> via the authentication method C<AUTH>
-and the password C<PASSWORD>. Returns the number of messages 
-(like I<login>) if successful and undef if the authentication failed. 
-Remember that the connection is not closed if the authentication fails. 
-You may issue a different authentication attempt. If you once are 
+and the password C<PASSWORD>. Returns the number of messages
+(like I<login>) if successful and undef if the authentication failed.
+Remember that the connection is not closed if the authentication fails.
+You may issue a different authentication attempt. If you once are
 successfully authenticated, you cannot send the C<AUTH> command again.
+
+=item response ()
+
+Does the same as within Net::POP3, but returns the additional code 201 
+for a "+ string" message.
 
 =back
 
