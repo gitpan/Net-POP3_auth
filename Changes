@@ -1,5 +1,9 @@
 Revision history for Perl extension Net::POP3_auth.
 
+0.04  Mon Nov  9 16:09:13 CET 2009
+        - service should be "pop" not "pop3" according to RFC 5034
+          (reported by Yasuhiro Hiraishi)
+
 0.03  Fre Jul 11 21:33:39 CEST 2003
 	- changed MIME::Base64 function calls
         - changed authentication to use Authen::SASL instead of

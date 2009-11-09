@@ -26,7 +26,7 @@ use MIME::Base64;
 use Digest::HMAC_MD5 qw(hmac_md5_hex);
 use Authen::SASL;
 
-$VERSION = "0.03";
+$VERSION = "0.04";
 
 @ISA = qw(Net::POP3);
 
@@ -75,7 +75,7 @@ sub auth {
 				);
     return unless $sasl;
     my $host = ${*$me}{'net_pop3_host'};
-    my $conn = $sasl->client_new("pop3", $host);#, "noplaintext noanonymous");
+    my $conn = $sasl->client_new("pop", $host);#, "noplaintext noanonymous");
 
     $me->_AUTH($auth) or return;
 
